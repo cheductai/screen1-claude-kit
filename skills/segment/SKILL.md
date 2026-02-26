@@ -111,6 +111,7 @@ ruleGroups: [
     conjunction: 'and' | 'or',                // Combine conditions within rule
     segmentObject: 'session' | 'user' | ...,  // Target object type
     conditionFocus: 'property' | 'metric' | ..., // Condition focus type
+    embeddedSegmentId: 'uuid-or-null',         // (Optional) ID of another segment embedded into this rule group
     dateRangeFilter: {
       type: 'lifetime-of-the-object' | 'previous-period' | 'specific-date-range',
       numberOfDaysPrevious: 30,
@@ -150,6 +151,11 @@ ruleGroups: [
 | DELETE | `/client/segment` | `removeSegment` | Delete segment |
 | PUT | `/client/segment/expire/:accountId` | `expireAllSegmentsByAccount` | Expire/refresh all segments |
 
+### Embedded Segments
+| Method | Path | Controller | Purpose |
+|---|---|---|---|
+| GET | `/client/segments/:accountId/available-for-embedding/:segmentId?` | `getAvailableSegmentsForEmbedding` | Get segments available to embed (filters out self, circular deps, non-custom) |
+
 ### Segment Options & Preview
 | Method | Path | Controller | Purpose |
 |---|---|---|---|
@@ -187,9 +193,9 @@ Core business logic (key functions):
 
 | Function | Purpose |
 |---|---|
-| `handleCreateSegment` | Generate UUID, build BigQuery CREATE TABLE query via `getSegmentData()`, queue BigQuery job, serialize ruleGroups, insert DB record, clear Redis cache |
-| `handleUpdateSegment` | Update name/description/status/queryStatus, regenerate BigQuery table if queryStatus is IN_PROGRESS, clear caches, update related report views |
-| `handleRemoveSegment` | Delete from DB, drop BigQuery table, clear cache |
+| `handleCreateSegment` | Generate UUID, validate embedded segments, build BigQuery CREATE TABLE query via `getSegmentData()`, queue BigQuery job, serialize ruleGroups, insert DB record, sync `isEmbeddedBy` tracking, clear Redis cache |
+| `handleUpdateSegment` | Update name/description/status/queryStatus, validate embedded segments, regenerate BigQuery table if queryStatus is IN_PROGRESS, sync `isEmbeddedBy` tracking only when embedded IDs changed, clear caches, update related report views |
+| `handleRemoveSegment` | Block deletion if segment is embedded by others (returns parent names in error), clean up `isEmbeddedBy` on child segments, delete from DB, drop BigQuery table, clear cache |
 | `handleGetSegmentById` | Fetch by ID, deserialize ruleGroups, strip query field |
 | `handleGetAllSegmentByAccount` | Redis-cached retrieval, fallback to DB, deserialize all ruleGroups |
 | `handleGetOptionDataByAccount` | Fetch filter options (CHECKLIST, OTHER_FIELD, PIPELINE_STATUS, INTENT, METRIC, CONVERSION, ECOMMERCE, EVENT_NAME, EVENT_VARIABLE, SALES_CONVERSION), 1-hour Redis cache |
@@ -199,6 +205,22 @@ Core business logic (key functions):
 | `handleUpdateSegmentReport` | Link/unlink segments to reports, max 4 concurrent segments per report, handle sticky behavior |
 | `handleApplySegmentForChart` | Apply selected segments to chart visualizations |
 | `scriptCreateDefaultSegment` | Create default "All Data" segment per account |
+| `extractEmbeddedSegmentIds` | Extract embedded segment IDs from parsed ruleGroups array |
+| `checkCircularDependency` | BFS traversal to detect circular embedding chains (supports in-memory dependency map for batch checks) |
+| `validateEmbeddedSegments` | Validates no duplicates, no self-embedding, all exist, no circular dependencies |
+| `syncEmbeddedByTracking` | Diffs old vs new embedded IDs and calls `updateEmbeddedByBulk` to sync `isEmbeddedBy` arrays |
+| `handleGetAvailableSegmentsForEmbedding` | Returns custom segments available for embedding, filtered by circular dependency checks using in-memory dependency graph |
+
+### Segment Sync Service
+**File**: `server/services/segmentSync.js`
+
+Handles cascade rebuilds when an embedded segment is updated:
+
+| Function | Purpose |
+|---|---|
+| `triggerCascadeRebuild` | When an embedded segment changes, finds all parents via `isEmbeddedBy` and queues rebuilds. Redis-backed cycle protection (visited set, 1hr TTL) and debounce (5-minute window) |
+| `queueSegmentRebuild` | Sets segment `queryStatus` to IN_PROGRESS, builds new BigQuery table, queues check job. Redis dedup prevents double-queuing |
+| `handleRebuildComplete` | Clears queue key, restores `queryStatus` to DONE, invalidates cache, triggers cascade for next level of parents |
 
 ### Segment Testing Service
 **File**: `server/services/segmentTesting.js`
@@ -221,6 +243,11 @@ Function `handleSegmentTesting`: Tests segment queries for validity across all o
 | `findSegmentByAccountId(accountId)` | Get all for account |
 | `getCustomSegmentsByAccountId(accountId)` | Get only custom segments |
 | `findSegmentEnableByAccountId(accountId)` | Get active segments only |
+| `addEmbeddedByParent(segmentId, parentId)` | Add parent ID to segment's `isEmbeddedBy` JSONB array (prevents duplicates via `@>` check) |
+| `removeEmbeddedByParent(segmentId, parentId)` | Remove parent ID from segment's `isEmbeddedBy` array using `jsonb_agg` filter |
+| `findSegmentsEmbeddedBy(parentId)` | Find all segments whose `isEmbeddedBy` contains a given parent ID |
+| `getEmbeddedByParents(segmentId)` | Get the `isEmbeddedBy` array for a segment |
+| `updateEmbeddedByBulk(toAdd, toRemove, parentId)` | Batch add/remove parent from multiple segments' `isEmbeddedBy` arrays |
 
 #### SegmentReport Table Operations
 | Method | Purpose |
@@ -253,6 +280,7 @@ Function `handleSegmentTesting`: Tests segment queries for validity across all o
 | `status` | BOOLEAN | Default TRUE (enabled/disabled) |
 | `queryStatus` | VARCHAR(200) | Default 'in-progress' |
 | `query` | TEXT | BigQuery cronjob query |
+| `isEmbeddedBy` | JSONB | Array of parent segment IDs that embed this segment. Default `[]`. GIN-indexed for fast `@>` lookups |
 | `created_at` | TIMESTAMP | |
 | `updated_at` | TIMESTAMP | |
 
@@ -285,7 +313,7 @@ Function `handleSegmentTesting`: Tests segment queries for validity across all o
 |---|---|
 | `getSegmentData(data)` | **Entry point**. Generates `createTableQuery` (CREATE OR REPLACE TABLE) and `cronjobQuery` (INSERT INTO for incremental updates). For reports: returns `cteQuery` + `filterCondition`. |
 | `getSegmentQuery(data)` | Builds complete segment BigQuery table with CTEs per rule group. Combines rules with AND/OR. Handles both LL and CRM objects. |
-| `getRuleQuery(data)` | Routes individual rule to appropriate builder by conditionFocus. Returns SELECT DISTINCT objectId with CTE conditions. |
+| `getRuleQuery(data)` | Routes individual rule to appropriate builder by conditionFocus. Returns SELECT DISTINCT objectId with CTE conditions. If rule group has `embeddedSegmentId`, adds `objectId IN (SELECT objectId FROM segment_table)` filter (AND with regular conditions, or standalone if no conditions). Salesforce-aware: includes `type = 'ObjectType'` filter when enabled. |
 | `getPreventInsideSegmentQuery(data)` | Builds preview queries: popular values, sample values, unique count. |
 | `getFinalSegmentQuery(data)` | Constructs final report query applying segment filters with LIMIT/OFFSET/sorting. |
 
@@ -328,6 +356,10 @@ For each ruleGroup:
     +-- RELATIONSHIP --> getObjectDataByRelationship()
     |
     +-- OTHER_EVENT --> getObjectDataByOtherEvent()
+    |
+    +-- If embeddedSegmentId present:
+          +-- WITH conditions: AND objectId IN (SELECT objectId FROM segment_{embeddedId})
+          +-- WITHOUT conditions: SELECT DISTINCT objectId FROM segment_{embeddedId}
   |
   v
 Combine rules with AND (INTERSECT DISTINCT) or OR (UNION)
@@ -349,27 +381,58 @@ Return: { createTableQuery, cronjobQuery }
   1. Receives SQS message with `accountId` and `timeZone`
   2. Reads server-side trigger rules from S3 (`server-side-trigger/{accountId}.json`)
   3. Queries PostgreSQL for active, non-blocked segments for the account
-  4. For each segment: replaces date placeholders, creates BigQuery batch job
-  5. If People/Company targets exist and hour < 12, sends SQS to schedule report queue
-- **Filters**: Only segments where `isBlocked = false`, `queryStatus = 'done'`, `query IS NOT NULL`, `totalBytesBilled < 10 GB`
-- **Key files**: `models/segments.js`, `lib/bigquery.js`, `s3/readFileStaticJson.js`, `helpers.js`
+  4. Uses `getProcessingOrder()` to topologically sort segments into dependency levels
+  5. For each level:
+     - Filters out segments whose embedded dependencies failed (`failedSegments` set)
+     - Submits all BigQuery batch jobs in parallel via `Promise.allSettled`
+     - For each segment: replaces date placeholders (`{{startDate_*}}`, `{{endDate_*}}`), calls `queryBQBatch`
+     - **Last level**: Skips waiting for job completion (no dependents need the result)
+     - **Other levels**: Waits for all jobs to complete via `job.promise()` before moving to next level
+     - Tracks failed segments to skip their dependents in later levels
+  6. If People/Company/Sales Conversion Event targets exist and hour < 12, sends SQS to schedule report queue (chunked in batches of 100)
+- **Filters**: Only segments where `isBlocked = false`, `queryStatus = 'done'`, `query IS NOT NULL`, `totalBytesBilled < 10 GB`, account not in Canceled/Dormant status
+- **Key files**: `models/segments.js`, `lib/bigquery.js`, `s3/readFileStaticJson.js`, `helpers.js`, `utils/dependencyGraph.js`
+
+### Dependency Graph Utility (HandleSegmentBigQuery)
+- **Path**: `lambda-functions/HandleSegmentBigQuery/utils/dependencyGraph.js`
+- **Purpose**: Topological sorting and cycle detection for segment processing order
+- **Exports**:
+  - `extractEmbeddedSegmentIds(segment)` — Extract embedded IDs from a segment's ruleGroups
+  - `buildDependencyGraph(segments)` — Build nodes/edges graph from segment array
+  - `hasCycle(graph)` — DFS-based cycle detection
+  - `topologicalSort(segments)` — Kahn's algorithm, returns segments grouped by processing level. Falls back to single level on cycle detection
+  - `getProcessingOrder(segments)` — Entry point. Fast path (single level) if no segments have embeddings, otherwise runs full topological sort
 
 ### 2. HandleCheckBigQueryJob
 - **Path**: `lambda-functions/HandleCheckBigQueryJob/`
 - **Handler**: `index.mjs`
 - **Trigger**: SQS (`AWS_QUEUE_CHECK_BIG_QUERY_JOB`)
 - **Purpose**: Monitors BigQuery job completion for segment creation/rebuild
+- **Retry limiting**: Skips processing if `ApproximateReceiveCount > 1` (prevents duplicate processing)
+- **Input validation**: `validateInput()` checks required fields (`jobId`, `accountId`, `action`), validates action type against `BQ_JOB_ACTION` enum, parses `jobInputData` as array
 - **What it does**:
   1. Receives SQS with `jobId`, `accountId`, `action`, `jobInputData`
-  2. Checks BigQuery API for job status every 15 seconds (max 5 minutes)
-  3. For `CREATE_SEGMENT` / `REBUILD_SEGMENT` actions:
+  2. Validates input, finds job in DB, skips if job status is not `in-progress`
+  3. Checks all BigQuery job statuses via `checkBigQueryJobStatus()` for each `bigQueryJobId` in payload
+  4. If not all jobs completed:
+     - Tracks `executionCount` (increments per check, 15s per execution)
+     - If under max time (5 minutes): re-queues SQS with 15s delay and current `executionCount`
+     - If max time exceeded: cancels all remaining PENDING/RUNNING jobs via `cancelBigQueryJob()`
+  5. For `CREATE_SEGMENT` / `REBUILD_SEGMENT` actions:
      - Maps BigQuery status to app status (DONE/PENDING/RUNNING/CANCELED/ERROR)
-     - Updates `Segments` table with `totalBytesBilled`, `buildAt`, `queryStatus`
+     - For `REBUILD_SEGMENT`: always sets `queryStatus` to DONE (not from BQ status mapping)
+     - For `CREATE_SEGMENT`: sets `queryStatus` from BQ status mapping
+     - Updates `Segments` table with `totalBytesBilled` (in GB, 0 for INSERT queries), `buildAt`
      - Clears Redis caches: `redis_segments_{accountId}`, `{accountId}_report_segment_{segmentId}_*`, `{accountId}_report_segments_*`
-     - Sends Pusher notification to frontend (`channel-{accountId}`)
-  4. If still running: re-queues SQS with 15-second delay
-  5. If timeout: cancels remaining jobs, updates status
-- **Key files**: `models/segments.mjs`, `models/bigqueryJobs.mjs`, `lib/bigquery.mjs`, `pusher.mjs`, `redis/index.mjs`
+     - Updates `BigQueryJobs` table with status and `bigQueryJobId`
+  6. **Cascade rebuild**: After successful completion (`queryStatus = DONE`):
+     - Fetches segments by IDs via `SegmentModel.findByIds()`
+     - For each segment with `isEmbeddedBy` parents:
+       - `REBUILD_SEGMENT`: calls `triggerCascadeRebuild({ action: 'rebuild-complete', cascadeId })` where `cascadeId` comes from `jobInputData`
+       - `CREATE_SEGMENT`: calls `triggerCascadeRebuild({ action: 'cascade-start' })`
+     - `triggerCascadeRebuild()` makes HTTP POST to `{REACT_APP_API}/internal/segment/cascade-rebuild` with `{ segmentId, action, cascadeId }` to notify the main app
+  7. Sends Pusher notification to frontend (`channel-{accountId}`)
+- **Key files**: `models/segments.mjs` (`find`, `findByIds`, `update`), `models/bigqueryJobs.mjs`, `lib/bigquery.mjs`, `pusher.mjs`, `redis/index.mjs`, `helpers.mjs`, `constants/index.mjs`
 - **Action types**: `create-segment`, `rebuild-segment`, `query-report`, `query-report-with-segment`
 
 ### 3. ReportRequests (Supporting)
@@ -416,6 +479,7 @@ Return: { createTableQuery, cronjobQuery }
 | `CRelationship.js` | Cross-object relationship count conditions |
 | `COtherEvent.js` | Custom event listener conditions |
 | `CDateRange.js` | Date range filter (lifetime, previous period, specific range) |
+| `CEmbeddedSegment.js` | Checkbox + dropdown to embed another segment into a rule group. Filters out already-embedded, failed, and in-progress segments. Shows loading state and building warnings |
 
 **Segment Usage in Reports**:
 - `client/src/components/cms/subscriber/analytics/segments/SegmentDropdown.js` - Segment selector dropdown (All/Default/Custom tabs, search, sticky toggle)
@@ -450,6 +514,7 @@ Return: { createTableQuery, cronjobQuery }
 | `API_CLIENT_EXPIRE_ALL_SEGMENT` | `client/segment/expire/:accountId` | PUT | Expire all segments |
 | `API_CLIENT_GET_SEGMENT_OPTION` | `client/segment/option` | POST | Get filter options |
 | `API_CLIENT_PREVIEW_INSIDE_SEGMENT` | `client/preview-inside-segment` | POST | Preview condition data |
+| `API_CLIENT_GET_AVAILABLE_SEGMENTS_FOR_EMBEDDING` | `client/segments/:accountId/available-for-embedding/:segmentId` | GET | Fetch segments available to embed |
 
 ### Client Constants
 **File**: `client/src/constants/segment.js`
@@ -487,11 +552,14 @@ POST /client/segment
        v
 Service: handleCreateSegment()
   - Generate UUID
+  - Extract embedded segment IDs from ruleGroups
+  - Validate embedded segments (circular deps, duplicates, self-embed)
   - Call getSegmentData() to build:
     - createTableQuery (CREATE OR REPLACE TABLE)
     - cronjobQuery (INSERT INTO for incremental updates)
   - Queue BigQuery job via QueueService.sendQueueCreateBigQueryJob()
   - Serialize ruleGroups, insert into Segments table
+  - Sync isEmbeddedBy tracking on embedded segments
   - Clear Redis cache (REDIS_KEYS.SEGMENTS)
        |
        v
@@ -560,19 +628,96 @@ HandleCheckBigQueryJob Lambda (if triggered)
 | `{accountId}_report_segments_*` | Report segment caches | Cleared on segment change |
 | `REDIS_KEYS.SEGMENT_INSIDE_PREVIEW` | Preview data | 1 hour |
 | Segment option caches | Filter options per variable type | 1 hour |
+| `segment_cascade_visited:{cascadeId}` | Visited set for cascade rebuild cycle protection | 1 hour |
+| `segment_rebuild_debounce:{segmentId}` | Debounce flag to prevent rebuild storms | 5 minutes |
+| `segment_rebuild_queue:{segmentId}` | Queue metadata for pending rebuilds (dedup) | 1 hour |
 
 ---
 
 ## Segment Lifecycle
 
-1. **Creation**: User defines rules -> BigQuery table created -> queryStatus: in-progress -> done
+1. **Creation**: User defines rules -> validate embedded segments -> BigQuery table created -> sync `isEmbeddedBy` -> queryStatus: in-progress -> done
 2. **Caching**: All segments cached in Redis per account (1-hour TTL)
-3. **Updating**: Rules modified -> BigQuery table recreated -> cache cleared
+3. **Updating**: Rules modified -> validate embedded segments -> BigQuery table recreated -> sync `isEmbeddedBy` (only if changed) -> cache cleared
 4. **Application**: Applied to reports (max 4) -> used as CTE filters in report queries
-5. **Incremental Update**: Cronjob queries INSERT new matching data into existing tables
+5. **Incremental Update**: Cronjob queries INSERT new matching data into existing tables (processed in topological order for embedded dependencies)
 6. **Preview**: User previews conditions -> BigQuery queried for sample/popular/unique values
-7. **Expiration/Rebuild**: Full refresh via expire or rebuild -> drops and recreates table
-8. **Deletion**: DB record deleted -> BigQuery table dropped -> cache cleared
+7. **Expiration/Rebuild**: Full refresh via expire or rebuild -> drops and recreates table -> cascade rebuild triggers parent segments
+8. **Deletion**: Block if embedded by others -> clean up `isEmbeddedBy` on child segments -> DB record deleted -> BigQuery table dropped -> cache cleared
+
+---
+
+## Embed Segment Inside Another
+
+Segments can be composed by embedding one segment into another segment's rule group. This narrows the rule group's results to only records that also belong to the embedded segment.
+
+### How It Works
+
+Each rule group can optionally have an `embeddedSegmentId` field referencing another segment. The query builder adds a subquery filter:
+- **With regular conditions**: `WHERE ... AND objectId IN (SELECT objectId FROM segment_{embeddedId})`
+- **Without conditions (embed only)**: `SELECT DISTINCT objectId FROM segment_{embeddedId})`
+
+### Bidirectional Tracking
+
+| Direction | Storage | Purpose |
+|---|---|---|
+| Parent → Child | `ruleGroups[].embeddedSegmentId` in parent's ruleGroups JSON | Query generation — parent knows which segment tables to reference |
+| Child → Parents | `isEmbeddedBy` JSONB array on child segment | Cascade rebuilds — child knows which parents to notify on change. Deletion protection — prevents deleting embedded segments |
+
+### Safety Mechanisms
+
+| Mechanism | Where | How |
+|---|---|---|
+| Circular dependency prevention | Service: `checkCircularDependency()` | BFS traversal through embedding chain |
+| Self-embedding prevention | Service: `validateEmbeddedSegments()` | Checks `embeddedSegmentIds.includes(parentId)` |
+| Duplicate embedding prevention | Client: `alreadyEmbeddedIds` + Service validation | Tracks all embedded IDs across rule groups |
+| Deletion protection | Service: `handleRemoveSegment()` | Checks `isEmbeddedBy` array, returns parent names in error |
+| Dependency ordering | Lambda: `dependencyGraph.js` | Topological sort ensures embedded segments build before parents in cronjobs |
+| Cascade rebuild | Service: `segmentSync.js` | When embedded segment changes, all parents auto-rebuild |
+| Rebuild debounce | Service: `triggerCascadeRebuild()` | 5-minute Redis window prevents rebuild storms |
+| Cycle protection in cascade | Service: `triggerCascadeRebuild()` | Redis visited set (1hr TTL) per cascade chain |
+
+### Cascade Rebuild Flow
+
+```
+Segment B (embedded) is updated/rebuilt
+       |
+       v
+triggerCascadeRebuild(segmentB.id)
+  - Check Redis visited set for cycle protection
+  - Check Redis debounce key (5-min window)
+  - Read segmentB.isEmbeddedBy -> [segmentA.id, segmentC.id]
+       |
+       v
+For each parent:
+  queueSegmentRebuild(parentId)
+    - Set queryStatus to IN_PROGRESS
+    - Notify frontend via Pusher
+    - Build new BigQuery table
+    - Queue HandleCheckBigQueryJob
+       |
+       v
+On rebuild complete:
+  handleRebuildComplete(parentId)
+    - Set queryStatus to DONE
+    - Invalidate Redis cache
+    - triggerCascadeRebuild(parentId) -> rebuilds grandparents
+```
+
+### Client-Side Flow
+
+```
+SegmentRuleStep
+  |-- State: availableSegmentsForEmbed, isLoadingEmbedSegments, alreadyEmbeddedIds
+  |-- Fetches: GET /client/segments/:accountId/available-for-embedding/:segmentId
+  |-- Syncs queryStatus from Redux listSegment to available segments
+  |-- Validates: no self-embed, no duplicates, selection required if toggled on
+  |
+  +-- CEmbeddedSegment (per rule group)
+       |-- Checkbox: "Embed another segment into this rule group"
+       |-- Dropdown: Select segment (filters out already-embedded, failed, in-progress)
+       |-- Warning: Shows if selected segment is still building
+```
 
 ---
 
@@ -613,6 +758,14 @@ HandleCheckBigQueryJob Lambda (if triggered)
 1. **Check BigQuery tables**: Ensure the account's analytics tables have data
 2. **Check Redis cache**: Preview results cached for 1 hour
 3. **Files**: `server/services/segments.js` -> `handlePreviewInsideSegment()`
+
+### Embedded segment issues
+1. **Cannot delete segment**: Check `isEmbeddedBy` column — segment is embedded by other segments. Remove the embedding from parent segments first.
+2. **Circular dependency error on save**: `checkCircularDependency()` BFS detected a cycle. Check the chain: A embeds B embeds C embeds A.
+3. **Cascade rebuild not triggering**: Check `segmentSync.js` logs. Verify `isEmbeddedBy` array is populated. Check Redis debounce key (`segment_rebuild_debounce:{segmentId}`).
+4. **Segments building in wrong order (cronjob)**: Check `dependencyGraph.js` topological sort. Verify `getProcessingOrder()` returns correct levels. Look for cycle fallback in logs.
+5. **Available segments list empty**: `handleGetAvailableSegmentsForEmbedding()` filters out non-custom, self, and circular-dependency-causing segments. Verify account has other custom segments with `queryStatus = 'done'`.
+6. **Files**: `server/services/segments.js`, `server/services/segmentSync.js`, `HandleSegmentBigQuery/utils/dependencyGraph.js`
 
 ### Real-time update not reaching frontend
 1. **Check Pusher**: `HandleCheckBigQueryJob` sends to `channel-{accountId}` with event `PUSHER_UPDATE_SEGMENT`
