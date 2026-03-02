@@ -218,9 +218,10 @@ Handles cascade rebuilds when an embedded segment is updated:
 
 | Function | Purpose |
 |---|---|
-| `triggerCascadeRebuild` | When an embedded segment changes, finds all parents via `isEmbeddedBy` and queues rebuilds. Redis-backed cycle protection (visited set, 1hr TTL) and debounce (5-minute window) |
-| `queueSegmentRebuild` | Sets segment `queryStatus` to IN_PROGRESS, builds new BigQuery table, queues check job. Redis dedup prevents double-queuing |
-| `handleRebuildComplete` | Clears queue key, restores `queryStatus` to DONE, invalidates cache, triggers cascade for next level of parents |
+| `updateSegmentStatus` | Helper that updates segment `queryStatus` in DB and sends Pusher notification in one call. Used by `queueSegmentRebuild` and `handleRebuildComplete` |
+| `triggerCascadeRebuild` | When an embedded segment changes, finds all parents via `isEmbeddedBy` and queues rebuilds. Redis-backed cycle protection (visited set, 1hr TTL). No debounce — relies on cycle protection and queue dedup |
+| `queueSegmentRebuild` | Calls `updateSegmentStatus` to set `queryStatus` to IN_PROGRESS, builds new BigQuery table, queues check job. Redis dedup prevents double-queuing. On failure or empty query, sets FAILED via `updateSegmentStatus` |
+| `handleRebuildComplete` | Clears queue key, calls `updateSegmentStatus` to restore `queryStatus` to DONE, invalidates cache, triggers cascade for next level of parents |
 
 ### Segment Testing Service
 **File**: `server/services/segmentTesting.js`
@@ -336,7 +337,10 @@ Function `handleSegmentTesting`: Tests segment queries for validity across all o
 ### Query Generation Flow
 
 ```
-getSegmentData({ segment, accountId, accountTimeZone })
+getSegmentData({ segment, accountId, accountTimeZone? })
+  |
+  v
+Auto-fetch accountTimeZone from AccountModel if not provided
   |
   v
 For each ruleGroup:
@@ -666,8 +670,7 @@ processSSTriggers()
 | `REDIS_KEYS.SEGMENT_INSIDE_PREVIEW` | Preview data | 1 hour |
 | Segment option caches | Filter options per variable type | 1 hour |
 | `segment_cascade_visited:{cascadeId}` | Visited set for cascade rebuild cycle protection | 1 hour |
-| `segment_rebuild_debounce:{segmentId}` | Debounce flag to prevent rebuild storms | 5 minutes |
-| `segment_rebuild_queue:{segmentId}` | Queue metadata for pending rebuilds (dedup) | 1 hour |
+| `segment_rebuild_queue:{segmentId}` | Queue metadata for pending rebuilds (dedup). Cleared on rebuild complete so segment can rebuild again on next trigger | 1 hour |
 
 ---
 
@@ -711,8 +714,8 @@ Each rule group can optionally have an `embeddedSegmentId` field referencing ano
 | Deletion protection | Service: `handleRemoveSegment()` | Checks `isEmbeddedBy` array, returns parent names in error |
 | Dependency ordering | Lambda: `dependencyGraph.js` | Topological sort ensures embedded segments build before parents in cronjobs |
 | Cascade rebuild | Service: `segmentSync.js` | When embedded segment changes, all parents auto-rebuild |
-| Rebuild debounce | Service: `triggerCascadeRebuild()` | 5-minute Redis window prevents rebuild storms |
 | Cycle protection in cascade | Service: `triggerCascadeRebuild()` | Redis visited set (1hr TTL) per cascade chain |
+| Queue dedup | Service: `queueSegmentRebuild()` | Redis key prevents double-queuing same segment. Cleared on rebuild complete |
 
 ### Cascade Rebuild Flow
 
@@ -722,7 +725,6 @@ Segment B (embedded) is updated/rebuilt
        v
 triggerCascadeRebuild(segmentB.id)
   - Check Redis visited set for cycle protection
-  - Check Redis debounce key (5-min window)
   - Read segmentB.isEmbeddedBy -> [segmentA.id, segmentC.id]
        |
        v
@@ -799,7 +801,7 @@ SegmentRuleStep
 ### Embedded segment issues
 1. **Cannot delete segment**: Check `isEmbeddedBy` column — segment is embedded by other segments. Remove the embedding from parent segments first.
 2. **Circular dependency error on save**: `checkCircularDependency()` BFS detected a cycle. Check the chain: A embeds B embeds C embeds A.
-3. **Cascade rebuild not triggering**: Check `segmentSync.js` logs. Verify `isEmbeddedBy` array is populated. Check Redis debounce key (`segment_rebuild_debounce:{segmentId}`).
+3. **Cascade rebuild not triggering**: Check `segmentSync.js` logs (filter by `[CascadeRebuild]` prefix). Verify `isEmbeddedBy` array is populated. Check Redis queue key (`segment_rebuild_queue:{segmentId}`) and visited set (`segment_cascade_visited:{cascadeId}`).
 4. **Segments building in wrong order (cronjob)**: Check `dependencyGraph.js` topological sort. Verify `getProcessingOrder()` returns correct levels. Look for cycle fallback in logs.
 5. **Available segments list empty**: `handleGetAvailableSegmentsForEmbedding()` filters out non-custom, self, and circular-dependency-causing segments. Verify account has other custom segments with `queryStatus = 'done'`.
 6. **Files**: `server/services/segments.js`, `server/services/segmentSync.js`, `HandleSegmentBigQuery/utils/dependencyGraph.js`
