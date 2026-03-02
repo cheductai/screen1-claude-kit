@@ -375,33 +375,60 @@ Return: { createTableQuery, cronjobQuery }
 ### 1. HandleSegmentBigQuery
 - **Path**: `lambda-functions/HandleSegmentBigQuery/`
 - **Handler**: `index.js`
-- **Trigger**: SQS (`SEND_MAIL_SCHEDULE_SAVE_REPORT_QUEUE_URL`)
-- **Purpose**: Processes segment cronjob queries for all accounts
+- **Trigger**: SQS (`HANDLE_SEGMENT_BIG_QUERY`)
+- **Purpose**: Processes segment cronjob queries for all accounts using SQS self-queuing for level-by-level execution
+- **Operating Modes**:
+  - **Initial invocation**: Receives `accountId` and `timeZone` from SQS, fetches segments, computes dependency levels, starts processing level 0
+  - **Continuation invocation**: Receives serialized state (levels, pendingJobs, failedSegments, checkCount), checks if previous level's BigQuery jobs are complete, advances to next level or re-queues
+- **Constants**: `CHECK_DELAY_SECONDS = 180` (3 min between status checks), `MAX_CHECK_COUNT = 10` (30 min max wait per level)
 - **What it does**:
   1. Receives SQS message with `accountId` and `timeZone`
-  2. Reads server-side trigger rules from S3 (`server-side-trigger/{accountId}.json`)
-  3. Queries PostgreSQL for active, non-blocked segments for the account
-  4. Uses `getProcessingOrder()` to topologically sort segments into dependency levels
-  5. For each level:
-     - Filters out segments whose embedded dependencies failed (`failedSegments` set)
-     - Submits all BigQuery batch jobs in parallel via `Promise.allSettled`
-     - For each segment: replaces date placeholders (`{{startDate_*}}`, `{{endDate_*}}`), calls `queryBQBatch`
-     - **Last level**: Skips waiting for job completion (no dependents need the result)
-     - **Other levels**: Waits for all jobs to complete via `job.promise()` before moving to next level
-     - Tracks failed segments to skip their dependents in later levels
-  6. If People/Company/Sales Conversion Event targets exist and hour < 12, sends SQS to schedule report queue (chunked in batches of 100)
-- **Filters**: Only segments where `isBlocked = false`, `queryStatus = 'done'`, `query IS NOT NULL`, `totalBytesBilled < 10 GB`, account not in Canceled/Dormant status
-- **Key files**: `models/segments.js`, `lib/bigquery.js`, `s3/readFileStaticJson.js`, `helpers.js`, `utils/dependencyGraph.js`
+  2. Queries PostgreSQL for active, non-blocked segments via `SegmentModel.findByAccountId()`
+  3. Uses `getProcessingOrder()` to topologically sort segments into dependency levels
+  4. Serializes levels (keeping only: id, name, query, ruleGroups) for SQS state passing
+  5. Calls `processNextLevel()` for level 0:
+     - `filterSegmentsByDependencies()` — excludes segments whose embedded dependencies failed
+     - `submitLevelJobs()` — submits all BigQuery batch jobs in parallel via `Promise.allSettled`. For each segment: parses ruleGroups, replaces date placeholders (`{{startDate_*}}`, `{{endDate_*}}`) via `replaceDateRangeQuery()`, sanitizes table name, calls `queryBQBatch()`
+     - **Last level**: Submits jobs and returns without waiting (no dependents need the result)
+     - **Non-last levels**: Self-queues SQS message with 180s delay containing `pendingJobs`, `levels`, `failedSegments`, `checkCount`
+  6. On continuation invocation: `checkPendingJobs()` checks BigQuery job statuses via `checkBigQueryJobStatus()`:
+     - All done → advance to next level via `processNextLevel()`
+     - Still running and `checkCount < MAX_CHECK_COUNT` → re-queue with incremented `checkCount`
+     - `checkCount >= MAX_CHECK_COUNT` → treat remaining as failed, advance to next level
+  7. After all levels complete: `processSSTriggers()` reads server-side trigger rules from S3 (`server-side-trigger/{accountId}.json`). If People/Company/Sales Conversion Event targets exist and hour < 12 in account timezone, fetches schedule triggers via `getAllScheduleSSTrigger()` and sends SQS to schedule report queue (chunked in batches of 100, 900s delay)
+- **Filters** (`findByAccountId`): `isBlocked = false`, `queryStatus = 'done'`, `query IS NOT NULL`, `totalBytesBilled < 10` (GB), `platformAccountStatus` NOT IN `['Canceled', 'Dormant (permanent)', 'Dormant (temporary)']`
+- **Key files**: `models/segments.js`, `lib/bigquery.js`, `s3/readFileStaticJson.js`, `helpers.js`, `utils/dependencyGraph.js`, `utils/index.js`
+- **Key functions**:
+  - `submitLevelJobs(segments, accountId, timeZone)` — Parse ruleGroups, replace date placeholders, submit BigQuery batch jobs in parallel. Returns `{ success, segmentId, bigQueryJobId }` per segment
+  - `checkPendingJobs(pendingJobs)` — Check BigQuery job statuses. Returns `{ allDone, failedSegmentIds }`
+  - `filterSegmentsByDependencies(segments, failedSegments)` — Exclude segments with failed embedded dependencies
+  - `processNextLevel(params)` — Orchestrate level processing: filter → submit → self-queue or return
+  - `processSSTriggers(accountId, timeZone)` — Post-processing: send scheduled report triggers
+  - `sendScheduleTriggerSavedReport(triggers, accountId, timeZone, targetObject)` — Chunk and send SQS messages for schedule triggers
 
 ### Dependency Graph Utility (HandleSegmentBigQuery)
 - **Path**: `lambda-functions/HandleSegmentBigQuery/utils/dependencyGraph.js`
 - **Purpose**: Topological sorting and cycle detection for segment processing order
 - **Exports**:
-  - `extractEmbeddedSegmentIds(segment)` — Extract embedded IDs from a segment's ruleGroups
-  - `buildDependencyGraph(segments)` — Build nodes/edges graph from segment array
-  - `hasCycle(graph)` — DFS-based cycle detection
-  - `topologicalSort(segments)` — Kahn's algorithm, returns segments grouped by processing level. Falls back to single level on cycle detection
+  - `extractEmbeddedSegmentIds(segment)` — Extract embedded IDs from a segment's ruleGroups (handles string or object). Returns empty array on parse error
+  - `buildDependencyGraph(segments)` — Build nodes/edges graph from segment array. Only includes edges where both segments exist in current dataset
+  - `hasCycle(graph)` — DFS-based cycle detection using recursion stack
+  - `topologicalSort(segments)` — Kahn's algorithm using reverse dependency map and in-degree counting. Returns segments grouped by processing level. Falls back to single level on cycle detection
   - `getProcessingOrder(segments)` — Entry point. Fast path (single level) if no segments have embeddings, otherwise runs full topological sort
+
+### BigQuery Integration (HandleSegmentBigQuery)
+- **Path**: `lambda-functions/HandleSegmentBigQuery/lib/bigquery.js`
+- **Exports**:
+  - `queryBQBatch({ query, accountId, type, tableName })` — Creates BigQuery batch job with `useLegacySql: false`, `priority: 'BATCH'`, labels for `account_id`/`type`/`table_name`. Returns job object or undefined on error
+  - `checkBigQueryJobStatus(jobId)` — Retrieves job metadata, returns `{ jobId, status }`. Status values: `PENDING`, `RUNNING`, `DONE`, `ERROR`, `NOT_FOUND`
+
+### Utilities (HandleSegmentBigQuery)
+- **Path**: `lambda-functions/HandleSegmentBigQuery/utils/index.js`
+- **Exports**:
+  - `parseJSON(jsonString)` — Safe JSON parse, returns null on failure
+  - `getDateFormat(date, timeZone, format)` — dayjs date formatting with timezone
+  - `splitIntoChunks(arr, limit=100)` — Chunk array for batching SQS messages
+  - `replaceDateRangeQuery(query, ruleGroups)` — Replace `{{startDate_N}}` / `{{endDate_N}}` placeholders using `dateRangeFilter.numberOfDaysPrevious` from the Nth ruleGroup
 
 ### 2. HandleCheckBigQueryJob
 - **Path**: `lambda-functions/HandleCheckBigQueryJob/`
@@ -451,6 +478,7 @@ Return: { createTableQuery, cronjobQuery }
 
 | Queue | Purpose | Producer | Consumer |
 |---|---|---|---|
+| `HANDLE_SEGMENT_BIG_QUERY` | Trigger segment cronjob processing and self-queue for level-by-level execution | Scheduler, HandleSegmentBigQuery (self) | HandleSegmentBigQuery |
 | `AWS_QUEUE_CHECK_BIG_QUERY_JOB` | Monitor BigQuery job completion | Segment creation/rebuild, ReportRequests | HandleCheckBigQueryJob |
 | `SEND_MAIL_SCHEDULE_SAVE_REPORT_QUEUE_URL` | Trigger scheduled report processing | HandleSegmentBigQuery | Schedule report handler |
 
@@ -601,20 +629,29 @@ Service: handleUpdateSegmentReport()
 ### Segment Cronjob (Incremental Update) Flow
 
 ```
-[Scheduled trigger]
+[Scheduled SQS trigger → HANDLE_SEGMENT_BIG_QUERY queue]
        |
        v
-HandleSegmentBigQuery Lambda
+HandleSegmentBigQuery Lambda (Initial Invocation)
   - Query PostgreSQL for active segments (isBlocked=false, queryStatus=done, <10GB)
-  - For each segment: replace date placeholders in cronjob query
-  - Submit BigQuery batch jobs (INSERT INTO segment_{id})
+  - getProcessingOrder() → topological sort into dependency levels
+  - processNextLevel(level=0):
+    - Filter out segments with failed dependencies
+    - For each segment: replace date placeholders, submit BigQuery batch job
+    - Last level: submit and return (no wait)
+    - Other levels: self-queue SQS with 180s delay
+       |
+       v (SQS self-trigger after 180s)
+HandleSegmentBigQuery Lambda (Continuation Invocation)
+  - checkPendingJobs() → check BigQuery job statuses
+  - If still running & checkCount < 10: re-queue with checkCount++
+  - If all done or checkCount >= 10: processNextLevel(level+1)
+  - Repeat until all levels processed
        |
        v
-[BigQuery processes incremental data insertion]
-       |
-       v
-HandleCheckBigQueryJob Lambda (if triggered)
-  - Track completion, update status
+processSSTriggers()
+  - Read S3 trigger rules, check schedule
+  - If targets exist & hour < 12: send SQS to schedule report queue
 ```
 
 ---
@@ -786,6 +823,7 @@ Contains all enums: `SEGMENT_OBJECT`, `CONDITION_FOCUS`, `SEGMENT_FIELD_TYPE`, `
 
 - `REDIS_URL` - Redis connection for caching
 - `POSTGRES_HOST`, `POSTGRES_USERNAME`, `POSTGRES_PASSWORD` - PostgreSQL connection
+- `HANDLE_SEGMENT_BIG_QUERY` - SQS queue for segment cronjob processing (also used for self-queuing)
 - `AWS_QUEUE_CHECK_BIG_QUERY_JOB` - SQS queue for BigQuery job monitoring
 - `SEND_MAIL_SCHEDULE_SAVE_REPORT_QUEUE_URL` - SQS queue for scheduled reports
 - `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_CLOUD_PROJECT` - BigQuery authentication
