@@ -46,20 +46,64 @@ Intents are AI-powered rules that automatically process data and populate custom
 ### 1. IntentHandleProcess
 - **Path**: `lambda-functions/IntentHandleProcess/`
 - **Handler**: `index.mjs`
-- **Purpose**: Main orchestrator for intent rule processing
-- **What it does**:
-  1. Receives event with `accountId`, `triggerRecordIds`, `triggerType`, `redisKeys`
-  2. Retrieves active intent rules linked to triggers
-  3. Deduplicates via BigQuery `TriggerObjectExistence` table
-  4. Fetches datasets and LLM model configuration
-  5. Builds prompts for each object using `build_prompt.mjs`
-  6. Handles priority properties (stores in DynamoDB `IntentRequestLogs` if incomplete)
-  7. Queues LLM requests to SQS with configurable delays
-  8. Tracks execution in BigQuery `TriggerObjectExistence` table
+- **Purpose**: Main orchestrator for intent rule processing — handles both SQS trigger events AND DynamoDB stream events
+- **Dual Input Routing**: The handler inspects the event to determine the source:
+  - `event.Records[0].dynamodb` → DynamoDB stream event → routes to `handleDynamodbStreamEvent()`
+  - Otherwise → SQS/direct invocation → normal rule processing flow
+
+#### Normal Flow (SQS / Direct Invocation)
+1. Receives event with `accountId`, `triggerRecordIds`, `triggerType`, `redisKeys`
+2. Retrieves active intent rules linked to triggers
+3. Deduplicates via BigQuery `TriggerObjectExistence` table
+4. Fetches datasets and LLM model configuration
+5. Builds prompts for each object using `build_prompt.mjs`
+6. **Priority property check**: If rule has `propertiesData` with `section === 'Intent Properties'`, creates an `IntentRequestLog` record instead of immediately queuing the LLM request
+7. For rules without priority properties, queues LLM requests to SQS directly
+8. Tracks execution in BigQuery `TriggerObjectExistence` table
+
+#### IntentRequestLogs & DynamoDB Stream Flow
+When a rule depends on **priority properties** (other intent properties that must be filled first), the Lambda uses IntentRequestLogs with DynamoDB Streams to coordinate:
+
+**Record Creation** (normal flow):
+```javascript
+{
+  id: "{objectId}_{ruleId}",           // Composite key
+  ruleId, objectId, accountId,
+  triggerLogId: intentTriggerLog.id,
+  messageData: JSON.stringify({ ...initMessage, rule, dataset, record }),
+  priorityPropertyIds: JSON.stringify(priorityPropertyIds),  // Properties that must be filled
+  createdAt, expiresAt                  // 30-day TTL
+}
+```
+- `priorityPropertyIds` — Array of property IDs (from `propertiesData` where `section === 'Intent Properties'`) that must ALL have values before this rule can execute
+- `messageData` — Full context (rule config, dataset, record data) needed to build the LLM prompt later
+- Records are batch-written via `dynamoHandler.batchPutItems()`
+
+**MODIFY Stream Event** (triggered when IntentHandlePropertyValues updates a property on the log):
+1. Receives the modified IntentRequestLog record
+2. Checks if ALL `priorityPropertyIds` now have values: `priorityPropertyIds.every(id => updateItem[id])`
+3. If all properties are filled → deletes the record via `dynamoHandler.deleteIntentRequestLog(id)`
+4. If not yet complete → no action (waits for more property updates)
+
+**REMOVE Stream Event** (triggered by the deletion above, or by TTL expiry):
+1. Extracts `messageData` from `OldImage` (the deleted record)
+2. Verifies all priority properties have values
+3. If verified:
+   - Reconstructs the record with all populated property values
+   - Builds final `userPrompt` using `buildIntentPrompt()` with the complete record
+   - Sends to `HANDLE_REQUEST_LLM_QUEUE_URL` via SQS for LLM processing
+
+**How Properties Get Updated on the Log:**
+- `IntentHandlePropertyValues` Lambda processes an LLM result for a different rule targeting the same object
+- It queries IntentRequestLogs by `objectId` (via GSI)
+- For each matching log, checks if the completed property is in its `priorityPropertyIds`
+- If yes, calls `dynamoHandler.updateIntentTriggerLog(log.id, propertyId, value)` — adding a new attribute to the record
+- This UPDATE triggers the MODIFY stream event back to IntentHandleProcess
+
 - **Batching**: Processes up to 500 records per invocation; sends SQS to itself for continuation
 - **Concurrency**: Breaks rules into max 5 concurrent chunks with 60-second delays
 - **Key files**: `index.mjs`, `utils/build_prompt.mjs`, `model/triggerObjectExistence.mjs`, `model/db_handler.mjs`, `model/dynamo_handler.mjs`
-- **Triggered by**: SQS from server-side triggers, manual runs, or reruns
+- **Triggered by**: SQS from server-side triggers, manual runs, or reruns; **DynamoDB Streams** from IntentRequestLogs table (MODIFY and REMOVE events)
 
 ### 2. IntentHandlePropertyValues
 - **Path**: `lambda-functions/IntentHandlePropertyValues/`
@@ -271,10 +315,22 @@ Controls behavior when re-running on records that already have property values:
 ### DynamoDB Tables
 
 **IntentRequestLogs** (`dynamodb_table_intent_request_logs`)
-- **PK**: `id` = `{objectId}_{ruleId}`
-- **GSI**: `objectId`
-- Fields: `accountId`, `ruleId`, `triggerLogId`, `messageData` (stringified JSON), `priorityPropertyIds` (array), `createdAt`, `expiresAt` (30-day TTL)
-- Purpose: Track in-progress requests with missing priority properties
+- **PK**: `id` = `{objectId}_{ruleId}` (composite key ensuring uniqueness per rule per object)
+- **GSI**: `objectId` (used by IntentHandlePropertyValues to find logs for a given object)
+- **DynamoDB Streams**: Enabled — MODIFY and REMOVE events trigger IntentHandleProcess Lambda
+- **Fields**:
+  - `accountId`, `ruleId`, `objectId`, `triggerLogId`
+  - `messageData` — Stringified JSON containing full rule config, dataset, and record data (deleted from logs before CloudWatch output)
+  - `priorityPropertyIds` — Stringified JSON array of property IDs that must all be filled
+  - `{propertyId}` — Dynamic attributes added by IntentHandlePropertyValues as each priority property is filled
+  - `createdAt`, `expiresAt` (30-day TTL for automatic cleanup)
+- **Purpose**: Coordinate multi-property intent rules — holds the request until ALL priority properties are populated by other intent rules, then triggers final LLM processing via DynamoDB stream
+- **Lifecycle**:
+  1. **Created** by IntentHandleProcess when a rule has priority properties
+  2. **Updated** by IntentHandlePropertyValues as each priority property gets its LLM result
+  3. **Stream MODIFY** → IntentHandleProcess checks if all properties are filled → deletes record if complete
+  4. **Stream REMOVE** → IntentHandleProcess rebuilds prompt with all property values → sends to LLM queue
+  5. **TTL cleanup** → Auto-expires after 30 days if never completed
 
 **ServerSideDataActionIntentPropertyLog** (`dynamodb_table_ss_data_action_intent_property_log`)
 - **PK**: `objectId`
