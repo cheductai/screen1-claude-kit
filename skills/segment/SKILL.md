@@ -218,10 +218,9 @@ Handles cascade rebuilds when an embedded segment is updated:
 
 | Function | Purpose |
 |---|---|
-| `updateSegmentStatus` | Helper that updates segment `queryStatus` in DB and sends Pusher notification in one call. Used by `queueSegmentRebuild` and `handleRebuildComplete` |
-| `triggerCascadeRebuild` | When an embedded segment changes, finds all parents via `isEmbeddedBy` and queues rebuilds. Redis-backed cycle protection (visited set, 1hr TTL). No debounce — relies on cycle protection and queue dedup |
+| `updateSegmentStatus` | Helper that updates segment `queryStatus` in DB and sends Pusher notification in one call. Used by `queueSegmentRebuild` |
+| `triggerCascadeRebuild` | When an embedded segment changes, finds all parents via `isEmbeddedBy` and queues rebuilds in parallel (`Promise.all`). Redis-backed cycle protection (visited set, 1hr TTL). No debounce — relies on cycle protection and queue dedup |
 | `queueSegmentRebuild` | Calls `updateSegmentStatus` to set `queryStatus` to IN_PROGRESS, builds new BigQuery table, queues check job. Redis dedup prevents double-queuing. On failure or empty query, sets FAILED via `updateSegmentStatus` |
-| `handleRebuildComplete` | Clears queue key, calls `updateSegmentStatus` to restore `queryStatus` to DONE, invalidates cache, triggers cascade for next level of parents |
 
 ### Segment Testing Service
 **File**: `server/services/segmentTesting.js`
@@ -456,13 +455,11 @@ Return: { createTableQuery, cronjobQuery }
      - Updates `Segments` table with `totalBytesBilled` (in GB, 0 for INSERT queries), `buildAt`
      - Clears Redis caches: `redis_segments_{accountId}`, `{accountId}_report_segment_{segmentId}_*`, `{accountId}_report_segments_*`
      - Updates `BigQueryJobs` table with status and `bigQueryJobId`
-  6. **Cascade rebuild**: After successful completion (`queryStatus = DONE`):
-     - Fetches segments by IDs via `SegmentModel.findByIds()`
-     - For each segment with `isEmbeddedBy` parents:
-       - `REBUILD_SEGMENT`: calls `triggerCascadeRebuild({ action: 'rebuild-complete', cascadeId })` where `cascadeId` comes from `jobInputData`
-       - `CREATE_SEGMENT`: calls `triggerCascadeRebuild({ action: 'cascade-start' })`
-     - `triggerCascadeRebuild()` makes HTTP POST to `{REACT_APP_API}/internal/segment/cascade-rebuild` with `{ segmentId, action, cascadeId }` to notify the main app
-  7. Sends Pusher notification to frontend (`channel-{accountId}`)
+  6. Sends Pusher notification to frontend (`channel-{accountId}`)
+  7. **Cascade rebuild**: After successful completion (`queryStatus = DONE`), in parallel (`Promise.all`):
+     - For all rebuild segments: clears `segment_rebuild_queue:{segmentId}` Redis key
+     - For segments with `isEmbeddedBy` parents: calls `triggerCascadeRebuild()` which makes HTTP POST to `{REACT_APP_API}/internal/segment/cascade-rebuild` with `{ segmentId, cascadeId }` to trigger next level via the main app's `triggerCascadeRebuild`
+     - DB update, Pusher, and queue key cleanup are all handled in the lambda — no `handleRebuildComplete` round-trip to the main app
 - **Key files**: `models/segments.mjs` (`find`, `findByIds`, `update`), `models/bigqueryJobs.mjs`, `lib/bigquery.mjs`, `pusher.mjs`, `redis/index.mjs`, `helpers.mjs`, `constants/index.mjs`
 - **Action types**: `create-segment`, `rebuild-segment`, `query-report`, `query-report-with-segment`
 
@@ -715,7 +712,7 @@ Each rule group can optionally have an `embeddedSegmentId` field referencing ano
 | Dependency ordering | Lambda: `dependencyGraph.js` | Topological sort ensures embedded segments build before parents in cronjobs |
 | Cascade rebuild | Service: `segmentSync.js` | When embedded segment changes, all parents auto-rebuild |
 | Cycle protection in cascade | Service: `triggerCascadeRebuild()` | Redis visited set (1hr TTL) per cascade chain |
-| Queue dedup | Service: `queueSegmentRebuild()` | Redis key prevents double-queuing same segment. Cleared on rebuild complete |
+| Queue dedup | Service: `queueSegmentRebuild()` | Redis key prevents double-queuing same segment. Cleared by lambda on rebuild complete |
 
 ### Cascade Rebuild Flow
 
@@ -723,23 +720,24 @@ Each rule group can optionally have an `embeddedSegmentId` field referencing ano
 Segment B (embedded) is updated/rebuilt
        |
        v
-triggerCascadeRebuild(segmentB.id)
+triggerCascadeRebuild(segmentB.id)  [main app]
   - Check Redis visited set for cycle protection
   - Read segmentB.isEmbeddedBy -> [segmentA.id, segmentC.id]
        |
        v
-For each parent:
-  queueSegmentRebuild(parentId)
-    - Set queryStatus to IN_PROGRESS
-    - Notify frontend via Pusher
+For each parent (in parallel via Promise.all):
+  queueSegmentRebuild(parentId)  [main app]
+    - Set queryStatus to IN_PROGRESS + Pusher notification
     - Build new BigQuery table
     - Queue HandleCheckBigQueryJob
        |
        v
-On rebuild complete:
-  handleRebuildComplete(parentId)
-    - Set queryStatus to DONE
-    - Invalidate Redis cache
+HandleCheckBigQueryJob Lambda completes:
+  - Set queryStatus to DONE in DB
+  - Send Pusher notification
+  - Clear segment_rebuild_queue:{segmentId}
+  - If segment has parents:
+    - HTTP POST to main app /internal/segment/cascade-rebuild
     - triggerCascadeRebuild(parentId) -> rebuilds grandparents
 ```
 
