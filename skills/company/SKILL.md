@@ -262,7 +262,7 @@ Key operation groups:
 
 | Table | Purpose | Key Fields |
 |---|---|---|
-| `DYNAMODB_TABLE_COMPANY` | Company master records | `id` (UUID v5), `domain`, `companyName`, `employees`, `revenue`, `sector`, `industry`, `confidence` |
+| `DYNAMODB_TABLE_COMPANY` | Company master records (unique by domain) | `id` (UUID v5 from domain), `domain` (has `domain-index` GSI), `companyName`, `employees`, `revenue`, `sector`, `industry`, `confidence` |
 | `DYNAMODB_TABLE_IP_COMPANY` | IP to company mapping | `ip`, `companyId`, `createdAt`, `endTime` (45-day TTL) |
 | `DYNAMODB_TABLE_DOMAIN_COMPANY` | Domain to company mapping | `domain`, `companyId`, `createdAt`, `endTime` |
 | `DYNAMODB_TABLE_ACCOUNT_COMPANY` | Account-specific company data | `id` (accountId+companyId), `accountId`, `companyId`, `dataSources`, `createdAt`, `providedAt`, `revealedAt`, `importedAt` |
@@ -402,7 +402,7 @@ Key operation groups:
 
 ```javascript
 {
-  companyId: string,           // UUID v5 (from name + domain)
+  companyId: string,           // UUID v5 (from domain) - ensures 1 domain = 1 company
   companyName: string,
   domain: string,
   logo: string,
@@ -683,10 +683,21 @@ Admin > Company Matches
 1. **Check blacklist**: `Handle_RevealedCompanies/constants/blacklist.js`
 2. **Check API response flags**: `isp`, `mobile`, `wifi` fields from Kickfire API
 
-### Company ID generation
-- UUID v5 is generated from company name + domain
-- This ensures the same company always gets the same ID
-- Lookup: `Handle_RevealedCompanies/services/companyDataService.js`
+### Company ID generation & domain uniqueness
+- **Rule**: Each company is unique by its `id`, and `id = uuidv5(domain, uuidv5.URL)`, so each company is also unique by domain
+- UUID v5 is generated from the **domain** using the URL namespace (`uuidv5.URL`)
+- This is consistent across all lambdas:
+  - `Handle_RevealedCompanies/services/companyHandler.js:32`: `id: company.id || uuidv5(company.domain, uuidv5.URL)`
+  - `HandleCheckDomainCompany/index.js:111`: `id: uuidv5(domain, uuidv5.URL)`
+  - `PayloadProcessor` (LLM path): delegates to `companyHandler.getCompanyDynamo()` which uses the same rule
+- **CAPI domain protection**: When merging data from TheCompaniesAPI, `'domain'` is included in `deleteFields` to prevent CAPI from overwriting the original domain. This is enforced in all three lambdas:
+  - `Handle_RevealedCompanies/services/companyDataService.js` (also has explicit `domain: this.domain` override)
+  - `HandleCheckDomainCompany/utils/index.js` (caller also explicitly sets `domain` after merge)
+  - `HandleAddMoreDataToTheCompany/utils/index.js` (critical — this was the only path where domain could be silently overwritten)
+- **Dedup layers**: Before creating a company, the system checks:
+  1. `DYNAMODB_TABLE_DOMAIN_COMPANY` (domain → companyId cache, 45-day TTL)
+  2. `DYNAMODB_TABLE_COMPANY` via `domain-index` GSI (query by domain)
+  3. Only if both miss, a new company is created with `uuidv5(domain)`
 
 ### Target account not syncing to BigQuery
 1. **Check isSyncBigQuery flag**: `TargetAccounts` table
