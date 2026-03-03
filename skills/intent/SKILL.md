@@ -377,6 +377,273 @@ Pusher notification to client
 
 ---
 
+## Priority Properties — Detailed Cross-Lambda Flow
+
+When a rule's `propertiesData` contains other intent properties (section `'Intent Properties'`), those dependent properties must be filled by other rules first. The system uses DynamoDB IntentRequestLogs with Streams to coordinate this across lambdas.
+
+### Code Locations
+
+| Step | File | Lines |
+|------|------|-------|
+| Priority property detection & log creation | `IntentHandleProcess/index.mjs` | 289-313 |
+| DynamoDB stream handler (MODIFY + REMOVE) | `IntentHandleProcess/index.mjs` | 20-99 |
+| Property value update on logs | `IntentHandlePropertyValues/index.mjs` | 59-69 |
+
+### Step-by-Step Flow
+
+```
+═══════════════════════════════════════════════════════════════
+ STEP 1: TRIGGER FIRES — IntentHandleProcess (Normal Flow)
+═══════════════════════════════════════════════════════════════
+
+  SST fires for ObjectX
+       │
+       ▼
+  IntentHandleProcess receives triggerRecordIds
+       │
+       ▼
+  Finds ALL active rules linked to this trigger
+  (e.g., Rule A targets PropertyA, Rule B targets PropertyB)
+       │
+       ▼
+  For each rule, for each object record:
+       │
+       ▼
+  ┌─────────────────────────────────────────────────────┐
+  │  Filter priorityPropertyIds:                        │
+  │  propertiesData.filter(option =>                    │
+  │    option.section === 'Intent Properties' &&        │
+  │    validRulesToProcess.some(r =>                    │
+  │      r.rule.propertyId === option.value &&          │
+  │      r.objects.some(obj =>                          │
+  │        obj.objectId === objectId)))                  │
+  │  .map(option => option.value)                       │
+  │                                                     │
+  │  (index.mjs lines 289-296)                          │
+  └─────────────────────────────────────────────────────┘
+       │
+       ▼
+  ┌──── priorityPropertyIds.length > 0? ────┐
+  │                                          │
+  │ YES (Rule B depends on Rule A)      NO (Rule A — independent)
+  │                                          │
+  ▼                                          ▼
+  Create IntentRequestLog             Build prompt immediately
+  in DynamoDB:                        with buildIntentPrompt()
+  {                                          │
+    id: "{objectId}_{ruleId}",               ▼
+    ruleId, objectId, accountId,      Queue to SQS →
+    messageData: JSON.stringify({     HANDLE_REQUEST_LLM_QUEUE_URL
+      ...initMessage,                (line 312)
+      rule, dataset, record
+    }),
+    priorityPropertyIds:
+      JSON.stringify([propertyA_id]),
+    expiresAt: now + 30 days
+  }
+  (lines 298-310)
+       │
+       ▼
+  Batch write all logs to DynamoDB
+  dynamoHandler.batchPutItems()
+  (lines 357-361)
+       │
+       ▼
+  Rule B is now WAITING
+  Rule A proceeds to LLM...
+
+
+═══════════════════════════════════════════════════════════════
+ STEP 2: RULE A COMPLETES — IntentHandlePropertyValues
+═══════════════════════════════════════════════════════════════
+
+  LLM returns result for Rule A (PropertyA value for ObjectX)
+       │
+       ▼
+  IntentHandlePropertyValues receives:
+  { accountId, ruleId: RuleA, objectId: ObjectX, llmResult }
+       │
+       ▼
+  Store result in PostgreSQL IntentPropertyValues
+  (lines 30-57 — handles BLOCK/APPEND/OVERRIDE)
+       │
+       ▼
+  Query DynamoDB IntentRequestLogs by objectId (via GSI)
+  intentRequestLogs = await dynamoHandler
+    .getIntentRequestLogs(objectId, accountId)
+  (line 59)
+       │
+       ▼
+  Found Rule B's log for ObjectX!
+       │
+       ▼
+  For each matching log:
+  ┌─────────────────────────────────────────────────────┐
+  │  Parse priorityPropertyIds from log                 │
+  │  Check: does priorityPropertyIds include            │
+  │         Rule A's propertyId? (line 65)              │
+  │                                                     │
+  │  YES → Build value string from intentValues         │
+  │        intentValues.map(i => i.value).join(', ')    │
+  │        (line 67)                                    │
+  │                                                     │
+  │  Call dynamoHandler.updateIntentTriggerLog(          │
+  │    log.id,          // "{objectId}_{ruleB_id}"      │
+  │    propertyId,      // Rule A's property ID         │
+  │    intentRequestPropertyValue  // "the LLM result"  │
+  │  )                                                  │
+  │  (line 68)                                          │
+  │                                                     │
+  │  This ADDS a new attribute to the DynamoDB record:  │
+  │  { propertyA_id: "the LLM result" }                │
+  └─────────────────────────────────────────────────────┘
+       │
+       ▼
+  DynamoDB record updated → triggers MODIFY stream event
+
+
+═══════════════════════════════════════════════════════════════
+ STEP 3: STREAM MODIFY — IntentHandleProcess
+═══════════════════════════════════════════════════════════════
+
+  DynamoDB Stream fires MODIFY event
+       │
+       ▼
+  IntentHandleProcess.handler() receives event
+  eventRecord.dynamodb exists → routes to
+  handleDynamodbStreamEvent() (lines 110-111)
+       │
+       ▼
+  case 'MODIFY': (line 29)
+  Unmarshall NewImage → updateItem
+       │
+       ▼
+  Parse priorityPropertyIds from updateItem
+       │
+       ▼
+  ┌─────────────────────────────────────────────────────┐
+  │  Check ALL properties filled:                       │
+  │  isReadyToProcess =                                 │
+  │    priorityPropertyIds.length > 0 &&                │
+  │    priorityPropertyIds.every(                       │
+  │      propId => updateItem[propId]                   │
+  │    )                                                │
+  │  (line 34)                                          │
+  └─────────────────────────────────────────────────────┘
+       │
+       ├──── All filled? ────────────────────────┐
+       │                                          │
+       │ YES                                 NO (still waiting
+       ▼                                     for other properties)
+  DELETE the record:                              │
+  dynamoHandler.deleteIntentRequestLog(           ▼
+    updateItem.id)                           No action.
+  (line 39)                                  Wait for next
+       │                                     MODIFY event.
+       ▼
+  Triggers REMOVE stream event
+
+
+═══════════════════════════════════════════════════════════════
+ STEP 4: STREAM REMOVE — IntentHandleProcess
+═══════════════════════════════════════════════════════════════
+
+  DynamoDB Stream fires REMOVE event
+       │
+       ▼
+  case 'REMOVE': (line 49)
+  Unmarshall OldImage → removeItem
+       │
+       ▼
+  Parse messageData (the original rule + dataset + record
+  context saved at creation time)
+       │
+       ▼
+  Parse priorityPropertyIds
+       │
+       ▼
+  ┌─────────────────────────────────────────────────────┐
+  │  For each priorityPropertyId:                       │
+  │    1. Find the property option from                 │
+  │       rule.propertiesData (to get the label)        │
+  │    2. Get the stored value: removeItem[propId]      │
+  │    3. Inject into record:                           │
+  │       newRecord[propertyOption.label] = value       │
+  │    4. Increment propertyMatchCount                  │
+  │  (lines 59-68)                                      │
+  └─────────────────────────────────────────────────────┘
+       │
+       ▼
+  ┌── propertyMatchCount === priorityPropertyIds.length? ──┐
+  │                                                         │
+  │ YES (all properties verified)              NO (incomplete
+  │                                            — TTL expiry)
+  ▼                                                    │
+  Build FINAL prompt with                          Skip — log
+  ALL property values injected:                    and return
+  buildIntentPrompt(
+    currentRule,
+    dataset,
+    newRecord  ← now includes PropertyA value!
+  )
+  (line 74)
+       │
+       ▼
+  Send to SQS: HANDLE_REQUEST_LLM_QUEUE_URL
+  with retry (maxRetries: 3)
+  (line 80)
+       │
+       ▼
+  Rule B's LLM request is now queued!
+       │
+       ▼
+  LLM processes → IntentHandlePropertyValues
+  stores Rule B's result → BigQuery sync → Done
+
+
+═══════════════════════════════════════════════════════════════
+ SAFETY NET: TTL CLEANUP
+═══════════════════════════════════════════════════════════════
+
+  If Rule A never completes (LLM failure, etc.):
+       │
+       ▼
+  DynamoDB auto-deletes record after 30 days (expiresAt)
+       │
+       ▼
+  REMOVE stream fires → but propertyMatchCount < required
+       │
+       ▼
+  Skipped — no LLM request sent. Rule B silently expires.
+```
+
+### Concrete Example
+
+Suppose you have:
+- **Rule A**: "Classify company industry" → writes to `PropertyA`
+- **Rule B**: "Generate sales pitch based on industry" → needs `PropertyA` as input
+
+Rule B's `propertiesData` includes `{ section: 'Intent Properties', value: PropertyA_id, label: 'Industry Classification' }`.
+
+1. SST fires for CompanyX → IntentHandleProcess picks up both rules
+2. Rule A has no priority properties → prompt built immediately → sent to LLM queue
+3. Rule B has `priorityPropertyIds: [PropertyA_id]` → saved to `IntentRequestLogs` with full context (rule, dataset, record)
+4. Rule A's LLM returns "SaaS Technology" → `IntentHandlePropertyValues` stores it in PostgreSQL, queries IntentRequestLogs by objectId, finds Rule B's log, updates it: `{ PropertyA_id: "SaaS Technology" }`
+5. MODIFY stream → IntentHandleProcess checks: all priority properties filled → DELETE the log
+6. REMOVE stream → IntentHandleProcess rebuilds record with `newRecord['Industry Classification'] = "SaaS Technology"` → builds prompt via `buildIntentPrompt()` → sends to LLM queue
+7. Rule B's LLM now has the industry classification in its prompt context and generates the sales pitch
+8. `IntentHandlePropertyValues` stores Rule B's result → BigQuery sync → done
+
+### Key Design Patterns
+
+- **Composite Key**: `{objectId}_{ruleId}` ensures one log per rule per object
+- **Dynamic Attributes**: Property values are added as new DynamoDB attributes (not nested), enabling the simple `every(propId => updateItem[propId])` check
+- **Two-Phase Delete**: MODIFY checks completeness and deletes; REMOVE does the actual work — this ensures `OldImage` contains all property values
+- **Self-Triggering Lambda**: IntentHandleProcess both creates the logs AND handles the stream events from those same logs
+- **TTL Safety Net**: 30-day expiry prevents orphaned records if upstream rules fail permanently
+
+---
+
 ## Client-Side Architecture
 
 ### Main Components
