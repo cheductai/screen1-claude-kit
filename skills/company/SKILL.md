@@ -89,16 +89,20 @@ Companies enter the system through three channels, tracked via `dataSources`:
      - **TheCompaniesAPI**: `https://api.thecompaniesapi.com/v1/companies/{domain}?token={token}`
   5. **Data transformation**: UUID v5 generation, NAICS code mapping, org type classification
   6. **Atomic quota reservation**: DynamoDB conditional update on AccountStatistics
-  7. **Batch storage**: Writes to Company, AccountCompany, IP-Company, Domain-Company tables
-  8. **SQS dispatch**: Sends to BigQuery queue, enrichment queue, and merge data queue
+  7. **Batch storage**: Writes to Company, IP-Company, Domain-Company tables; updates visitors
+  8. **SQS batch dispatch** (batches of 10 via `sendSQSBatch`):
+     - `HANDLE_CENTRALIZED_COMPANY_QUEUE` — CentralizedCompany upsert + session sync
+     - `HANDLE_COMPANIES_BIGQUERY_QUEUE` — BigQuery sync (deduped against centralized messages, expired companies only)
+     - `HANDLE_GRAPH_MERGE_DATA_QUEUE` — person identity merge
+  - **Note**: Handle_RevealedCompanies no longer sends SQS to HandleAddMoreDataToTheCompany
 - **Key files**:
   - `services/companyDataService.js` - External API integration with rate limiting
   - `processors/companyBatchProcessor.js` - Batch deduplication across payloads
   - `processors/payloadProcessor.js` - Core business logic per payload
-  - `services/visitorSyncService.js` - Visitor/session updates
-  - `services/storageService.js` - DynamoDB batch operations, SQS batching
+  - `services/syncService.js` - Visitor sync, account-company sync, request logging
+  - `services/storageService.js` - DynamoDB batch operations, SQS batch sending, BigQuery dedup
   - `models/dynamoHandler.js` - DynamoDB operations including atomic quota reservation
-  - `models/dbHandler.js` - PostgreSQL operations (account/package data)
+  - `models/dbHandler.js` - PostgreSQL operations (account/package data, CentralizedCompany lookups)
   - `constants/index.js` - 442+ personal domains, rate limits, source types
   - `constants/naics.js` - NAICS industry classification
   - `constants/blacklist.js` - ISP/mobile blacklist
@@ -129,7 +133,31 @@ Companies enter the system through three channels, tracked via `dataSources`:
 - **Key files**: `models/dynamoHandler.js`, `helpers.js`
 - **Triggered by**: SQS (HANDLE_ADD_MORE_DATA_TO_THE_COMPANY_QUEUE)
 
-### 6. HandleCompanyBigQuery
+### 6. HandleCentralizedCompany
+- **Path**: `lambda-functions/HandleCentralizedCompany/`
+- **Handler**: `index.mjs`
+- **Purpose**: Upserts CentralizedCompany records in PostgreSQL, validates domains/LinkedIn, syncs company to DynamoDB sessions
+- **What it does**:
+  1. **Fetch companies from DynamoDB**: Batch get by companyId, parse socialNetworks from JSON string
+  2. **Validate domain & LinkedIn** (parallel): HTTP checks for domain reachability (concurrency: 10) and LinkedIn URL validity (concurrency: 5), updates DynamoDB Company table with results
+  3. **Prepare records**: Build CentralizedCompany records with companyName, domain, dataSources, validDomain, validLinkedin, firstSessionId, date fields
+  4. **Upsert to PostgreSQL**: `INSERT ... ON CONFLICT (companyId, accountId)` with merge logic:
+     - `dataSources`: append new sources (skip if 'imported' or already present)
+     - `firstSessionId`: `COALESCE(existing, excluded)` — set only if previously null
+     - Date fields (`revealedAt`, `providedAt`, `importedAt`): keep earliest via COALESCE
+     - Returns `xmax::text` for INSERT vs UPDATE detection
+  5. **Send BigQuery SQS**: Only for new records (xmax='0') or records where dataSources changed
+  6. **Sync company to session**: For new records or records where firstSessionId was just set — fetches session from DynamoDB, adds company to session.companies array, batch updates sessions
+- **Key files**:
+  - `models/db_handler.mjs` - PostgreSQL upsert with ON CONFLICT, xmax detection
+  - `models/dynamo_handler.mjs` - DynamoDB batch get/update (companies, sessions, validation)
+  - `services/centralizedCompanyService.mjs` - Record preparation
+  - `services/domainValidationService.mjs` - HTTP domain validation
+  - `services/linkedinValidationService.mjs` - LinkedIn URL validation
+  - `helpers.mjs` - SQS batch sending (batches of 10)
+- **Triggered by**: SQS (HANDLE_CENTRALIZED_COMPANY_QUEUE)
+
+### 7. HandleCompanyBigQuery
 - **Path**: `lambda-functions/HandleCompanyBigQuery/`
 - **Handler**: `index.js`
 - **Purpose**: Sync company data to BigQuery via S3
@@ -278,7 +306,7 @@ Key operation groups:
 |---|---|---|
 | `CompanyIdentifier` | Company identifier metadata | id, accountId, visitorId, sessionId, companyId, type, value, source, status, enrichmentStatus, llmStatus |
 | `TargetAccounts` | Target accounts with company mapping | id, accountId, domain, companyId, isBO, isSyncBigQuery, companyData (serialized JSON) |
-| `CentralizedCompany` | Centralized company master data | id, accountId, name, domain, status, validDomain, validLinkedin, validPersonMatch, invalidPersonMatch, qualityScore |
+| `CentralizedCompany` | Centralized company master data | id, companyId, accountId, firstSessionId, companyName, domain, sourceFirst, sourceLast, dataSources, linkedinURL, validDomain, validLinkedin, validPersonMatch, invalidPersonMatch, peopleCount, qualityScore, status, revealedAt, providedAt, importedAt. **Unique constraint**: (companyId, accountId). **Indexes**: accountId, companyId, domain, (accountId, domain) |
 | `AccountGroups` | Target account group definitions | id, accountId, name, type (LIST_OF_ACCOUNTS/DYNAMIC_LIST), conditions |
 | `TargetAccountGroups` | Many-to-many: accounts to groups | targetAccountId, accountGroupId |
 
@@ -557,27 +585,29 @@ Handle_RevealedCompanies
   - Generates UUID v5 company ID
   - Validates (not ISP/mobile/personal domain)
   - Atomic quota reservation
-  - Stores in DynamoDB (company, IP-company, domain-company, account-company)
-  - Updates visitor/session records
-  - Sends to enrichment + BigQuery queues
+  - Stores in DynamoDB (company, IP-company, domain-company)
+  - Updates visitor records
+  - SQS fan-out (batch sending):
+    → HandleCentralizedCompany (upsert + session sync)
+    → HandleCompanyBigQuery (expired companies only, deduped)
+    → GraphMergeData (person merge)
        |
-       v
-HandleAddMoreDataToTheCompany
-  - Fetches extended data from TheCompaniesAPI
-  - Merges with existing company records
-  - Updates DynamoDB
-  - Triggers BigQuery sync
-       |
-       v
-HandleCompanyBigQuery
-  - Maps company data to BigQuery schema
-  - Uploads JSON to S3
-  - BigQuery ingests from S3
-       |
-       v
-[Analytics / Dashboards in datalayerapp-v2]
-  - Query builders serve company data
-  - CompanyIdentifier & CompanyMatch endpoints
+       ├───────────────────────────────┐
+       v                               v
+HandleCentralizedCompany        HandleCompanyBigQuery
+  - Validates domain + LinkedIn     - Maps company data to BigQuery schema
+  - Updates DynamoDB Company        - Uploads JSON to S3
+  - Upserts CentralizedCompany     - BigQuery ingests from S3
+    in PostgreSQL (ON CONFLICT)            |
+  - Syncs company to session               v
+  - Sends to BigQuery queue ──────> [Analytics / Dashboards]
+    (new/changed records)             - Query builders serve data
+                                      - CompanyIdentifier & CompanyMatch
+
+HandleAddMoreDataToTheCompany (triggered separately, not by Handle_RevealedCompanies)
+  - Fetches extended data from TheCompaniesAPI (concurrency: 50)
+  - Merges with existing DynamoDB company records
+  - Sends to BigQuery queue for all linked accounts
 ```
 
 ---
@@ -647,9 +677,14 @@ Admin > Company Matches
 | Queue | Purpose | Producer | Consumer |
 |---|---|---|---|
 | `HANDLE_REVEALED_COMPANIES_QUEUE` | Domain revelation requests | HandleThreadCreateCompanies | Handle_RevealedCompanies |
-| `HANDLE_ADD_MORE_DATA_TO_THE_COMPANY_QUEUE` | Enrichment requests | Handle_RevealedCompanies | HandleAddMoreDataToTheCompany |
-| `HANDLE_COMPANIES_BIGQUERY_QUEUE` | BigQuery sync | Handle_RevealedCompanies, HandleAddMoreDataToTheCompany | HandleCompanyBigQuery |
+| `HANDLE_CENTRALIZED_COMPANY_QUEUE` | CentralizedCompany upsert + session sync | Handle_RevealedCompanies | HandleCentralizedCompany |
+| `HANDLE_ADD_MORE_DATA_TO_THE_COMPANY_QUEUE` | Enrichment requests | External trigger | HandleAddMoreDataToTheCompany |
+| `HANDLE_COMPANIES_BIGQUERY_QUEUE` | BigQuery sync | HandleCentralizedCompany, HandleAddMoreDataToTheCompany, Handle_RevealedCompanies (expired only) | HandleCompanyBigQuery |
 | `HANDLE_GRAPH_MERGE_DATA_QUEUE` | Person merge data | Handle_RevealedCompanies | Graph processing lambda |
+
+**BigQuery dedup**: Handle_RevealedCompanies filters `sqsCompanyBigQueryMessages` to exclude items already in `sqsCentralizedCompanyMessages`, since HandleCentralizedCompany sends its own BigQuery SQS after upsert.
+
+**SQS batching**: Both Handle_RevealedCompanies and HandleCentralizedCompany use `sendSQSBatch` (batches of 10 via `SendMessageBatchCommand`) to reduce SQS API calls.
 
 ---
 
@@ -713,6 +748,18 @@ Admin > Company Matches
 1. **Check CompanyIdentifier table**: Validation, enrichment, and LLM statuses
 2. **Check CentralizedCompany table**: Overall status, quality scores
 3. **Files**: `server/models/companyIdentifier.js`, `server/models/centralizedCompany.js`
+
+### Session not showing company
+1. **Session sync moved to HandleCentralizedCompany**: Session company sync is triggered after CentralizedCompany upsert, not in Handle_RevealedCompanies
+2. **Sync conditions**: Only for new CentralizedCompany records (xmax='0') or existing records where `firstSessionId` was null (just got set via COALESCE)
+3. **Check DynamoDB session**: Query SESSIONS table for the sessionId, inspect `companies` JSON array
+4. **Check HandleCentralizedCompany logs**: Look for "Session sync: N session(s) updated"
+
+### CentralizedCompany not created
+1. **Check SQS delivery**: Handle_RevealedCompanies sends to `HANDLE_CENTRALIZED_COMPANY_QUEUE` via `sendSQSBatch`
+2. **Check message format**: Must include `{ companyId, accountId, sessionId, companyDataSource }`
+3. **Check HandleCentralizedCompany logs**: Look for upsert counts and errors
+4. **Check unique constraint**: CentralizedCompany has `UNIQUE(companyId, accountId)` — ON CONFLICT handles duplicates
 
 ---
 
