@@ -184,6 +184,10 @@ When a rule depends on **priority properties** (other intent properties that mus
 | `handleGetSampleData` | Fetch sample records from BigQuery |
 | `handleGetIntentReview` | Get execution review data |
 | `handleGetIntentReviewServerSideTriggers` | Get SST execution results |
+| `handleListWithFilters` | List historical intent analyses with pagination and date filtering (lines 800-883) |
+| `getAverages` | Calculate averages for most recent 5 jobs — avgInputTokens, avgOutputTokens, avgTotalTokens, avgCostPerAnalysis (lines 890-906) |
+| `getReviewRuleId` | Get detailed historical review data for a specific rule (lines 913-939) |
+| `getIntentReviewServerSideTriggers` | Get SST execution results with success/fail aggregations (lines 941-967) |
 | `buildIntentPrompt` | Build LLM prompt from rule config |
 
 ### Prompt Building
@@ -304,13 +308,19 @@ Controls behavior when re-running on records that already have property values:
 - `data` (JSONB — classification items with descriptions)
 - `oldData` (JSONB — version history)
 
-**LLMTrackingRequest** (execution log)
+**LLMTrackingRequest** (execution log — real-time data source for Historical Intent)
 - `id` (serial PK), `accountId`, `llmModelId`, `runAt`, `status` ('pending'/'completed'/'failed')
 - `prompt` (text), `result` (text), `inputTokens`, `outputTokens`, `totalCost`
 - `triggerType` ('server_side_trigger'/'manual_preview'/'manual_run'/'rerun_intent')
 - `sourceId` (intent rule ID), `objectId` (people/company ID)
 - `referenceId` (links to IntentPropertyValues)
 - `numberOfRetries`, `csvData`, `isPreviewCharged`
+
+**LLMDailyReport** (aggregated historical data)
+- Aggregated daily summary of intent analyses
+- Used by Historical Intent UI for past days (non-today data)
+- Queried by `handleListWithFilters` with date range filtering
+- Fields include: `runAt`, `inputTokens`, `outputTokens`, `cost`, `status` ('done'/'failed'), rule metadata
 
 ### DynamoDB Tables
 
@@ -652,7 +662,7 @@ Rule B's `propertiesData` includes `{ section: 'Intent Properties', value: Prope
 |-----------|------|---------|
 | Intent Analysis (root) | `client/src/components/cms/subscriber/goals/intelligence/intent-analysis.js` | Feature toggle, tabs for Rules/Datasets/Properties |
 | Manage Intent Rules | `client/src/components/cms/subscriber/goals/intent-analysis/manage-intent-rules.js` | List, create/edit modal, status toggle |
-| Review Intent Rules | `client/src/components/cms/subscriber/goals/intent-analysis/manage-intent-rules/ReviewIntentRules.js` | Execution history container |
+| Review Intent Rules (Historical Intent) | `client/src/components/cms/subscriber/goals/intent-analysis/manage-intent-rules/ReviewIntentRules.js` | Historical Intent page — date-range filtered execution history with mostRecentInsights averages |
 | Review Prompt | `client/src/components/cms/subscriber/goals/intent-analysis/manage-intent-rules/components/ReviewPrompt.js` | Paginated review with SST/Rerun/Preview sections, status badges, token/cost info |
 | Classification Datasets | `client/src/components/cms/subscriber/goals/intent-analysis/classification-data-sets.js` | Dataset CRUD, import/export, AI generation |
 | Sample Data | `client/src/components/cms/subscriber/goals/intent-analysis/manage-intent-rules/components/SampleData.js` | Sample data display for testing |
@@ -776,6 +786,20 @@ domain, companyName, revenue, employees, industry, primaryIndustry, businessType
 2. **Check HandleCompanyBigQuery/HandlePersonBigQuery**: These lambdas include intent property values in their BigQuery mapping
 3. **Check LLMTrackingRequest.referenceId**: Should link to the `IntentPropertyValues` record
 
+### Historical Intent review showing no data or missing entries
+1. **Check date range**: Default is 30 days back — extend if looking for older data
+2. **Check LLMDailyReport table**: Historical (non-today) data comes from this aggregated table, not `LLMTrackingRequest`
+3. **Check LLMTrackingRequest for today**: Current-day data is queried real-time from `LLMTrackingRequest` where `runAt` = today
+4. **Check model**: `server/models/intentRules.js` `findTrackingRequestWithPagination` (lines 334-509) — verify both real-time and historical queries
+5. **Check ruleId filter**: If filtering by rule, verify the `sourceId` matches in tracking records
+
+### Historical SST not processing records
+1. **Check queueName**: Must be `'historical'` (DAILY_NAME.HISTORICAL constant)
+2. **Check rule.dateField**: The date field must exist on the record and contain a valid date (`dayjs().isValid()`)
+3. **Check rule.filterHistorical**: Historical SSTs use a separate filter — verify it's configured correctly
+4. **Check TriggerProcessor logs**: `HandleServerSideTrigger/services/TriggerProcessor.mjs` line 265+ — look for `historicalSync` flag
+5. **Check redis-data schema**: Validate `isHistorical` flag and `queueName` in the SQS payload
+
 ### Cannot delete a server-side trigger
 - If the SST is linked to an intent rule via `IntentRules.triggers`, deletion is blocked
 - Error: "You cannot [action] this trigger because it is being used by the following IntentRules"
@@ -830,3 +854,122 @@ User selects records and clicks "Rerun" (UI)
   → Results stored in IntentPropertyValues + synced to BigQuery
   → Pusher notification to client
 ```
+
+---
+
+## Historical Intent
+
+Historical Intent provides two capabilities: a **review UI** for viewing past intent analyses, and **historical SST processing** for backfilling data from external sources with original timestamps.
+
+### 1. Historical Intent Review UI
+
+The "Historical Intent" page lets users review all past intent rule executions with date-range filtering and performance metrics.
+
+**Component**: `client/src/components/cms/subscriber/goals/intent-analysis/manage-intent-rules/ReviewIntentRules.js`
+- Page title: `<h1>Historical Intent</h1>` (line 176)
+- Default date range: 30 days back from today (lines 19-20)
+- State: `dateHistory`, `dateHistoryEnd` for date filtering; `mostRecentInsights` for averages (lines 22-26)
+
+**Endpoints**:
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/client/intent-rules/review/account/:accountId/paginated` | Paginated historical records with date range, sort, rule filter |
+| GET | `/client/intent-rules/review/account/:accountId/most-recent-insight` | Average metrics from most recent 5 jobs |
+
+**Query Params** (paginated endpoint): `page`, `pageSize`, `startDate`, `endDate`, `sortBy=created_at`, `sortOrder=desc`, `ruleId`
+
+#### Data Source Separation (Model: `server/models/intentRules.js` — `findTrackingRequestWithPagination`, lines 334-509)
+
+The model separates real-time and historical data into two queries:
+
+| Source | Table | Condition | Flag |
+|--------|-------|-----------|------|
+| Real-time (today) | `LLMTrackingRequest` | `runAt` = today's date | `isToday: true` |
+| Historical (past days) | `LLMDailyReport` | Date range filters on `runAt` | `isToday: false` |
+
+- Both are combined, sorted, and returned with pagination (line 501)
+- The `firstDailyReportIndex` (line 171 in UI) separates "Current Date" from "Daily Report" sections in the accordion
+
+#### mostRecentInsights Tooltip (lines 216-226)
+
+Displays averages from the most recent 5 jobs (model: `getAverages`, lines 516-566):
+- Average Token In (`avgInputTokens`)
+- Average Tokens Out (`avgOutputTokens`)
+- Average Total Tokens (`avgTotalTokens`)
+- Average Cost Per Analysis (`avgCostPerAnalysis`)
+
+#### Review Detail Drill-Down
+
+| Service Function | Model Function | Purpose |
+|------------------|----------------|---------|
+| `getReviewRuleId` (line 913) | `findByReviewId` (line 568) | View individual rule execution history — joins `LLMTrackingRequest` with `IntentRules`, filters by date range, maps `BREAK_LIMIT` status to `FAILED` |
+| `getIntentReviewServerSideTriggers` (line 941) | `getIntentReviewServerSideTriggersByFilters` (line 632) | SST execution summary — joins `LLMTrackingRequest` with `ServerSideTriggers`, groups by `triggerId`, aggregates `matchedCount`, `successCount`, `failedCount` |
+
+### 2. Historical SST Processing (Backfill)
+
+When importing historical data from external sources (e.g., Salesforce), server-side triggers can run in a **historical** processing mode that preserves original creation dates.
+
+**Constants** (`HandleServerSideTrigger/constants/index.mjs`, lines 61-67):
+```javascript
+DAILY_NAME = {
+    DAILY_NEW: 'DailyNew',
+    DAILY_UPDATE: 'DailyUpdate',
+    HISTORICAL: 'historical',    // Historical queue name
+    SCHEDULE: 'Schedule',
+    BEING_ACTIVE: 'BeingActive',
+}
+```
+
+**Schema** (`HandleServerSideTrigger/schemas/redis-data.json`):
+- `queueName` enum includes `"historical"` (line 48)
+- `isHistorical` boolean flag property (lines 84-86)
+
+#### Processing Flow
+
+```
+External data import (with historical dates)
+  │
+  ▼
+HandleServerSideTrigger (queueName = 'historical')
+  │
+  ▼
+TriggerProcessor.processCreationTrigger (lines 253-306)
+  - Detects historical mode: queueName === DAILY_NAME.HISTORICAL (line 265)
+  - Extracts historicalCreatedAt from rule.dateField (lines 271-276):
+      historicalCreatedAt = item[rule.dateField]
+      // Handles array format: { value: "..." }[0].value
+  - Validates: historicalSync && historicalCreatedAt && dayjs(historicalCreatedAt).isValid()
+  - Attaches historicalCreatedAt to event object (line 294)
+  │
+  ▼
+DataTransformer.createEventData (lines 255-276)
+  - Converts historicalCreatedAt via convertDate() (line 255-257)
+  - Includes in final event structure alongside systemCreatedAt (line 273-274)
+  │
+  ▼
+BaseTriggerStrategy.applyFiltering (lines 282-326)
+  - Uses rule.filterHistorical instead of rule.filter (lines 287-295):
+      if (queueName === 'historical' && rule.filterHistorical) {
+          filter = JSON.parse(rule.filterHistorical);
+      }
+  - Strips historicalCreatedAt from events before filter evaluation (lines 312, 319)
+  │
+  ▼
+Normal intent pipeline (IntentHandleProcess → LLM → IntentHandlePropertyValues)
+  - Execution logged in LLMTrackingRequest with historical context
+  - Viewable in Historical Intent UI alongside regular runs
+```
+
+#### Key Differences from Normal SST Processing
+
+| Aspect | Normal SST | Historical SST |
+|--------|-----------|----------------|
+| Queue name | `DailyNew` / `DailyUpdate` | `historical` |
+| Date field | Uses current timestamp | Uses `rule.dateField` from source record |
+| Filter | `rule.filter` | `rule.filterHistorical` (separate filter config) |
+| Flag | N/A | `isHistorical: true` in redis data |
+| Validation | Record is new + ActionType !== 'Failed' | Same + `historicalCreatedAt` must be valid date |
+
+### How They Connect
+
+When historical SSTs fire for intent-linked rules, the records flow through the normal intent pipeline (`IntentHandleProcess` → LLM → `IntentHandlePropertyValues`), and executions are logged in `LLMTrackingRequest`. These logs are then aggregated into `LLMDailyReport` and viewable in the Historical Intent review UI alongside regular server-side trigger, manual, and rerun executions.
