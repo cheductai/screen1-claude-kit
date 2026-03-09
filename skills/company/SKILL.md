@@ -194,7 +194,7 @@ Companies enter the system through three channels, tracked via `dataSources`:
 - Confidence ranges: 0-25, 26-50, 51-75, 76-85, 86-95
 
 ### Centralized Company (Admin)
-- `GET /admin/centralized-company/:accountId` - List centralized companies (filterable by name/domain/status/quality scores)
+- `GET /admin/centralized-company/:accountId` - List centralized companies (filterable by companyName, domain, sourceFirst, sourceLast, dataSources, validDomain, validLinkedin, enriched, validPersonMatch, invalidPersonMatch)
 - `GET /admin/centralized-company/retrieve/:id` - Retrieve single centralized company with account info
 - `POST /admin/centralized-company` - Find centralized company by account context
 - **Files**: `server/routes/centralizedCompany.js`, `server/controllers/centralizedCompany.js`, `server/services/centralizedCompany.js`, `server/models/centralizedCompany.js`
@@ -306,7 +306,7 @@ Key operation groups:
 |---|---|---|
 | `CompanyIdentifier` | Company identifier metadata | id, accountId, visitorId, sessionId, companyId, type, value, source, status, enrichmentStatus, llmStatus |
 | `TargetAccounts` | Target accounts with company mapping | id, accountId, domain, companyId, isBO, isSyncBigQuery, companyData (serialized JSON) |
-| `CentralizedCompany` | Centralized company master data | id, companyId, accountId, firstSessionId, companyName, domain, sourceFirst, sourceLast, dataSources, linkedinURL, validDomain, validLinkedin, validPersonMatch, invalidPersonMatch, peopleCount, qualityScore, status, revealedAt, providedAt, importedAt. **Unique constraint**: (companyId, accountId). **Indexes**: accountId, companyId, domain, (accountId, domain) |
+| `CentralizedCompany` | Centralized company master data | id, companyId, accountId, firstSessionId, companyName, domain, sourceFirst, sourceLast, dataSources, linkedinURL, validDomain, validLinkedin, enriched, validPersonMatch, invalidPersonMatch, peopleCount, revealedAt, providedAt, importedAt. **Unique constraint**: (companyId, accountId). **Indexes**: accountId, companyId, domain, (accountId, domain). **Filterable fields**: companyName, domain, sourceFirst, sourceLast, dataSources, validDomain, validLinkedin (ILIKE); enriched, validPersonMatch, invalidPersonMatch (boolean) |
 | `AccountGroups` | Target account group definitions | id, accountId, name, type (LIST_OF_ACCOUNTS/DYNAMIC_LIST), conditions |
 | `TargetAccountGroups` | Many-to-many: accounts to groups | targetAccountId, accountGroupId |
 
@@ -377,12 +377,13 @@ Key operation groups:
 - `client/src/components/cms/subscriber/goals/target-accounts/actions/apis.js` - API call functions
 
 **Admin Components**:
-- `client/src/components/cms/admin/centralized-company/index.js` - Centralized company database (filterable table)
-- `client/src/components/cms/admin/centralized-company/CentralizedCompanyDetails.js` - Single company enrichment detail
+- `client/src/components/cms/admin/centralized-company/index.js` - Legacy centralized company list (uses old qualityScore/status fields)
+- `client/src/components/cms/admin/centralized-company/CentralizedCompanyDetails.js` - Legacy single company detail
 - `client/src/components/cms/admin/company-matches/CompanyMatchesDetail.js` - KickFire API usage stats
 - `client/src/components/cms/admin/accounts/AccountRevealCompany.js` - Enable/disable reveal per account
 - `client/src/components/cms/admin/accounts/EnrichmentRule/retrieve/CompanyIdentifier.js` - Company identifier enrichment pipeline status
-- `client/src/components/cms/admin/accounts/EnrichmentRule/tabs/CentralizedCompanyPanel.js` - Admin panel for centralized company records
+- `client/src/components/cms/admin/accounts/EnrichmentRule/tabs/CentralizedCompanyPanel.js` - Current centralized company list (per-account, with enriched/validPersonMatch/invalidPersonMatch columns)
+- `client/src/components/cms/admin/accounts/EnrichmentRule/retrieve/CentralizedCompany.js` - Current centralized company detail (shows all fields including enriched, validDomain/validLinkedin badges, person match, peopleCount, source timestamps)
 
 ### Client Routing
 
@@ -662,7 +663,7 @@ Admin > Accounts > Account Detail
 
 Admin > Centralized Company
   +-- View all centralized company records
-  +-- Filter by account, status, quality score
+  +-- Filter by companyName, domain, sources, validation status, enriched, person match
   +-- View Detail: enrichment pipeline status (validation, enrichment, LLM)
 
 Admin > Company Matches
@@ -746,7 +747,7 @@ Admin > Company Matches
 
 ### Company enrichment pipeline status
 1. **Check CompanyIdentifier table**: Validation, enrichment, and LLM statuses
-2. **Check CentralizedCompany table**: Overall status, quality scores
+2. **Check CentralizedCompany table**: enriched flag, validDomain, validLinkedin, validPersonMatch, invalidPersonMatch, peopleCount
 3. **Files**: `server/models/companyIdentifier.js`, `server/models/centralizedCompany.js`
 
 ### Session not showing company
