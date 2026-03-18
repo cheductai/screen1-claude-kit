@@ -47,7 +47,7 @@ Every account has a default **"All Data"** segment (non-custom, no rules, always
 | Session | `session` | Browser sessions |
 | User | `user` | Anonymous users (cookie-based) |
 | People | `people` | Identified people (email/form) |
-| Company | `revealed-company` | Revealed companies from IP/domain |
+| Company | `revealed-company` | Companies (revealed from IP/domain + imported via CRM/target accounts) |
 | Web Conversion | `web-conversion` | Web conversion events |
 
 ### CRM Objects (Salesforce Integration)
@@ -312,7 +312,7 @@ Function `handleSegmentTesting`: Tests segment queries for validity across all o
 | Export | Purpose |
 |---|---|
 | `getSegmentData(data)` | **Entry point**. Generates `createTableQuery` (CREATE OR REPLACE TABLE) and `cronjobQuery` (INSERT INTO for incremental updates). For reports: returns `cteQuery` + `filterCondition`. |
-| `getSegmentQuery(data)` | Builds complete segment BigQuery table with CTEs per rule group. Combines rules with AND/OR. Handles both LL and CRM objects. |
+| `getSegmentQuery(data)` | Builds complete segment BigQuery table with CTEs per rule group. Combines rules with AND/OR. Handles both LL and CRM objects. Salesforce path: COMPANY and PEOPLE segments add UNION ALL subqueries for imported records (from `companiesStats`/`peopleStats` where `dataSourcePath = 'Imported'`). Non-Salesforce path: standard session→user→people join chain only. |
 | `getRuleQuery(data)` | Routes individual rule to appropriate builder by conditionFocus. Returns SELECT DISTINCT objectId with CTE conditions. If rule group has `embeddedSegmentId`, adds `objectId IN (SELECT objectId FROM segment_table)` filter (AND with regular conditions, or standalone if no conditions). Salesforce-aware: includes `type = 'ObjectType'` filter when enabled. |
 | `getPreventInsideSegmentQuery(data)` | Builds preview queries: popular values, sample values, unique count. |
 | `getFinalSegmentQuery(data)` | Constructs final report query applying segment filters with LIMIT/OFFSET/sorting. |
@@ -329,7 +329,7 @@ Function `handleSegmentTesting`: Tests segment queries for validity across all o
 | `property-metric/webConversionObject.js` | Web conversion property/metric conditions | Web conversion CTEs and filters |
 | `property-metric/crmObject.js` | CRM property/metric conditions | CRM object CTEs and filters |
 | `optimizedView.js` | `getObjectDataByOptimizedView` | WEB_CONVERSION_EVENT, ECOMMERCE_EVENT, SALES_CONVERSION_EVENT conditions |
-| `relationship.js` | `getObjectDataByRelationship` | RELATIONSHIP conditions (cross-object count filters via crmRelation table) |
+| `relationship.js` | `getObjectDataByRelationship` | RELATIONSHIP conditions (cross-object count filters). COMPANY uses `companiesStats` (RevealedCompaniesStats) as main table with pre-computed `sessionCount`, `userCount`, `peopleCount`; eventCount via metric CTE from session join chain. PEOPLE uses `peopleStats` with pre-computed `revealedCompanyCount`, `userID` array. Other LL objects use their own stats table; CRM objects use `crmRelation`. |
 | `otherEvent.js` | `getObjectDataByOtherEvent` | OTHER_EVENT conditions (custom event variables, listener data) |
 | `segmentUtils.js` | Utility functions | Date range filters, field aliases, UNNEST subqueries, table name resolution, property/metric filters, checklist filters |
 
